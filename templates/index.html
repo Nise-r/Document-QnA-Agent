@@ -27,6 +27,14 @@
       <button id="sendBtn" title="Send">📤</button>
     </div>
   </div>
+  <div class="chunk-panel" id="chunkPanel">
+      <div class="chunk-header" onclick="toggleChunkContent()">📄 Retrieved Chunks</div>
+      <div class="chunk-content collapsed" id="chunkContent">
+        <p>No chunks retrieved yet.</p>
+      </div>
+  </div>
+
+
 
   <script>
     let context = "";
@@ -72,6 +80,8 @@
 
       const data = await res.json();
       appendMessage("assistant", data.answer);
+        
+      fetchChunks();
       questionInput.focus();
     }
 
@@ -98,6 +108,39 @@
       chat.appendChild(msg);
       chat.scrollTop = chat.scrollHeight;
     }
+    function toggleChunkContent() {
+      const content = document.getElementById("chunkContent");
+      content.classList.toggle("expanded");
+      content.classList.toggle("collapsed");
+    }
+
+
+    async function fetchChunks() {
+      try {
+        const res = await fetch("/chunks");
+        const data = await res.json();
+        const chunks = data.chunks;
+
+        const contentDiv = document.getElementById("chunkContent");
+        contentDiv.innerHTML = "";
+
+        if (!chunks.length) {
+          contentDiv.innerHTML = "<p>No chunks retrieved yet.</p>";
+        } else {
+          chunks.forEach((chunk) => {
+            const p = document.createElement("p");
+            p.innerText = `🧩 ${JSON.stringify(chunk)}`;
+            p.style.marginBottom = "12px";
+            contentDiv.appendChild(p);
+          });
+        }
+      } catch (err) {
+        console.error("Error fetching chunks:", err);
+        document.getElementById("chunkContent").innerText = "⚠️ Failed to load chunks.";
+      }
+    }
+
+
       
     setInterval(async () => {
       try {
