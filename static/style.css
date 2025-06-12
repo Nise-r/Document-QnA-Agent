@@ -96,3 +96,51 @@ body {
 .input-row button:hover {
   background-color: #125aa0;
 }
+
+
+
+
+
+.chunk-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  margin: 1%;
+  width: 320px;
+/*   height: 95%; */
+  background: #ffffff;
+  border-left: 1px solid #ccc;
+  box-shadow: -2px 0 6px rgba(0, 0, 0, 0.1);
+  display: flex;
+  flex-direction: column;
+  z-index: 1000;
+}
+
+.chunk-header {
+  background-color: #1976d2;
+  color: white;
+  padding: 16px;
+  font-weight: bold;
+  text-align: center;
+  cursor: pointer;
+  border-bottom: 1px solid #ccc;
+}
+
+.chunk-content {
+  padding: 16px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  font-size: 14px;
+  line-height: 1.5;
+  max-height: 0;
+  transition: max-height 0.3s ease-out;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.chunk-content.expanded {
+  max-height: 600px; /* adjust based on desired dropdown height */
+  transition: max-height 0.5s ease-in;
+  overflow-y: auto;
+}
+
