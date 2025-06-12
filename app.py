@@ -3,14 +3,17 @@ import os
 import time
 from langgraph.types import Command, interrupt
 from werkzeug.utils import secure_filename
-from qna2 import agent, log_messages  # ✅ Replace with actual import
+from qna2 import agent, log_messages, ret_chunks  # ✅ Replace with actual import
 
 app = Flask(__name__)
 UPLOAD_FOLDER = './uploads'
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 ALLOWED_EXTENSIONS = {'pdf'}
+
+#global var
 pdf_path = None
 is_interrupted = False
+chat_history = []
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -34,7 +37,11 @@ def upload():
 
     try:
         file.save(save_path)
+        
+        print("="*10)
         print(f"[UPLOAD] File saved at: {save_path}")
+        print("="*10)
+        
         pdf_path = save_path
         
         return jsonify({'filepath': save_path})  # Send full path back
@@ -48,11 +55,16 @@ def get_logs():
     log_messages.clear()  # Optional: clear after sending
     return jsonify({'logs': logs_to_send})
 
-
+@app.route('/chunks', methods=['GET'])
+def get_chunks():
+    global ret_chunks
+    chunks_to_send = ret_chunks.copy()
+    ret_chunks.clear()  # Optional: clear after sending
+    return jsonify({'chunks': chunks_to_send})
 
 @app.route('/ask', methods=['POST'])
 def ask():
-    global pdf_path, is_interrupted
+    global pdf_path, is_interrupted, chat_history
     
     data = request.get_json()
     question = data.get('question', '').strip()
@@ -65,17 +77,21 @@ def ask():
     
     try:
         thread_config = {"configurable": {"thread_id": "some_id"}}
+        
+        print("="*10)
         print(f"[ASK] Question: {question}")
         print(f"[ASK] PDF Path: {path}")
+        print("="*10)
         
         if not is_interrupted:
             result = agent.invoke({
                 "query": question,
-                "pdf_path": path,  # None if not provided
+                "pdf_path": path, 
                 "result": "",
                 "imgs": [],
                 "paper_url": None,
                 "next_node": None,
+                "chat_history":chat_history
             }, config=thread_config)
             state = agent.get_state(thread_config)
             
@@ -84,13 +100,17 @@ def ask():
             if state and state.tasks and state.tasks[0].interrupts:
                 is_interrupted = True
                 return jsonify({'answer':f"{result['result']}\n\n{state.tasks[0].interrupts[0].value['query']}"})
+            
+            chat_history = result['chat_history']
             return jsonify({'answer': result['result']})
         else:
             result = agent.invoke(Command(resume=question),config=thread_config)
             is_interrupted = False
+            
+            chat_history = result['chat_history']
             return jsonify({'answer': result['result']})
     except Exception as e:
-#         print(f"result:{result}")
+
         return jsonify({'answer': f"❌ Error: {str(e)}"}), 500
 
 if __name__ == '__main__':
