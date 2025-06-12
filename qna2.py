@@ -6,7 +6,9 @@ import base64
 import time
 import os
 import pymupdf
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage,AIMessage
+from langchain.schema import BaseMessage
 from langchain.chat_models import init_chat_model
 from langchain.embeddings.huggingface import HuggingFaceEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -21,9 +23,11 @@ from langgraph.types import Command, interrupt
 from langgraph.graph import END, StateGraph
 from langgraph.checkpoint.memory import MemorySaver
 import arxiv
+from werkzeug.utils import secure_filename
 from sentence_transformers import CrossEncoder
 
 log_messages = []
+ret_chunks = []
 api_key = "YOUR_API_KEY"
 
 class Parser:
@@ -163,12 +167,16 @@ class AgentState(TypedDict):
     paper_url: str
     next_node: str
     prev_node: str
+    chat_history: List[BaseMessage]
 
 class Classifier(BaseModel):
+    reasoning: str = Field(
+        description="""Step by step reasoning for generated 'classify_intent'."""
+    )
     classify_intent: Literal["fetch_paper","RAG_qna"] = Field(
-        description = """Classify the intent of user query:
-        'fetch_paper' if user is asking for specific research paper for this the query should have words like 'retrieve','fetch',etc.
-        'RAG_qna' if user is asking questions directly."""
+        description = """Analyse the query and chat history then Classify the intent of user query,
+        'fetch_paper' if user is asking for specific research paper,strictly have words like 'fetch','retrieve','get'.
+        'RAG_qna' if user is asking questions directly about some topic."""
     )
 
 class Agent:
@@ -203,10 +211,11 @@ class Agent:
         print("In parse_and_embed")
         
         result = self._parser.parse_pdf(state['pdf_path'])
+        pdf_path = "/".join(state['pdf_path'].split('/')[:-1])+"/"+secure_filename(state['pdf_path'].split('/')[-1])
         
         docs_list = [Document(page_content=page['text']+"\n\n"+page['tables']+"\n\n"+"\n".join(page['imgs'][key] for key in page['imgs'].keys()),
                           metadata={"page": page['page'],"imgs":False if not page['imgs'] else ",".join(img.split('_')[1] for img in page['imgs']), 
-                                   'pdf_path':state['pdf_path']}) for page in result]
+                                   'pdf_path':pdf_path}) for page in result]
 
         doc_splits = self._text_splitter.split_documents(docs_list)
 
@@ -224,6 +233,7 @@ class Agent:
         log_messages.append("In fetch_arxiv_paper")
         
         print("In fetch_arxiv_paper")
+        
         all_papers=[]
 
         prompt = ChatPromptTemplate.from_messages([
@@ -237,7 +247,6 @@ class Agent:
         })
 
         docs = self._retriever_arxiv.invoke(result.content)
-    #     print(docs)
 
         for doc in docs:
             paper_info = {
@@ -248,26 +257,40 @@ class Agent:
             all_papers.append(paper_info)
 
         text = f"The relevant paper found:\n Title: {all_papers[0]['title']} \n\n Summary: {all_papers[0]['summary']}\n\n Source: {all_papers[0]['url']}"
+        
+        state["chat_history"].append(HumanMessage(content=state['query']))
+        state["chat_history"].append(AIMessage(content=text))
 
         return {'result':text,'paper_url': all_papers[0]['url'],'next_node':'user_confirmation','prev_node':'fetch_arxiv_paper'}
 
     def _rag_and_generate(self,state:AgentState):
-        global log_messages
+        global log_messages, ret_chunks
         log_messages.append("In rag_and_generate")
         
         print("In rag_and_generate")
 
         #query expander
         qe_prompt = ChatPromptTemplate.from_messages([
-            ("system","""You are a query expander agent.You expand the query for better retrieval from vector database.Your task is to create a expected answer .Just give the expected made up answer to the query, Nothing else.Maximum 50 words."""),
+            ("system","""
+            1.You are a query expander agent.
+            2.If the query seems vague like 'what is its purpose', reconstruct the query using the past conversation data.
+            3.You expand the query for better retrieval from vector database.
+            4.Your task is to create a expected answer .
+            5.Just give the expected made up answer to the query, Nothing else.
+            6.Maximum 50 words."""),
+            MessagesPlaceholder('chat_history'),
             ("human","Input:{input}")
         ])
         qe_chain = qe_prompt | self._llm
         result = qe_chain.invoke({
-            "input":state['query']
+            "input":state['query'],
+            "chat_history":state['chat_history']
         })
-    #     print(f"eq: {result.content}")
-
+        
+        print("="*10)
+        print(f"Expanded query: {result.content}")
+        print("="*10)
+        
         docs1 = self._retriever.invoke(result.content)
         docs2 = self._retriever.invoke(state['query'])
 
@@ -290,34 +313,50 @@ class Agent:
 
         prompt = ChatPromptTemplate.from_messages([
             ("system","""Use the following pieces of context to answer the question at the end. If you don't know the answer, just say that you don't know, don't try to make up an answer. Keep the answer as concise as possible. Always say "thanks for asking!" at the end of the answer"""),
+            MessagesPlaceholder('chat_history'),
             ("human","Context:{context}\n\nInput:{input}")
         ])
         chain = prompt | self._llm
 
         result = chain.invoke({
             "input":state['query'],
+            "chat_history":state['chat_history'],
             "context":top_3_content
         })
 
         try:
             pdf = pymupdf.open(docs[comb_text[0][1]].metadata['pdf_path'])
         except Exception as e:
-            print(f"ERROR:{e}")
+            print("="*10)
+            print(f"ERROR IN PDF OPENING:{e}")
             print(docs[comb_text[0][1]].metadata['pdf_path'])
+            print("="*10)
             return
+        
         imgs = []
         for t in comb_text:
+            #to show retrieved chunks on UI
+            ret_chunks.append(docs[t[1]].to_json())
+            
             if not docs[t[1]].metadata['imgs']:
                 continue
-
-            for img_no in docs[t[1]].metadata['imgs'].split(','):
-                img = pdf.extract_image(int(img_no))
-                base_img = img['image']
-                img_ext = img['ext']
-                image = base_img
-                imgs.append(image)
-
-        return {'result': result.content,'imgs':imgs,'prev_node':"rag_and_generate"}    
+            try:
+                for img_no in docs[t[1]].metadata['imgs'].split(','):
+                    img = pdf.extract_image(int(img_no))
+                    base_img = img['image']
+                    img_ext = img['ext']
+                    image = base_img
+                    imgs.append(image)
+            except Exception as e:
+                print("="*10)
+                print(f"ERROR IN IMAGE EXTRACTING:{e}")
+                print(docs[t[1]])
+                print("="*10)
+        
+        state["chat_history"].append(HumanMessage(content=state['query']))
+        state["chat_history"].append(AIMessage(content=result.content))
+        
+        return {'result': result.content,'imgs':imgs,'prev_node':"rag_and_generate"}  
 
     def _classify_query_intent(self,state:AgentState):
         global log_messages
@@ -325,17 +364,25 @@ class Agent:
         
         print("In classify_query_intent")
         
+
         result = self._llm_router.invoke(
             [
                 {"role": "system", "content": "you are an excellent classifier of user query."},
                 {"role": "user", "content": state['query']}
             ]
         )
+        
+        print("="*10)
+        print(result.reasoning)
+        print(result.classify_intent)
+        print("="*10)
+        
         if result.classify_intent == 'fetch_paper':
             return {'next_node':'fetch_arxiv_paper','prev_node':"classify_query_intent"}
         else:
             return {'next_node':'rag_and_generate','prev_node':"classify_query_intent"}
-       
+
+
     def _router(self,state:AgentState):
         print("In router")
         
@@ -355,7 +402,13 @@ class Agent:
             
             return {'next_node':'parse_and_embed','pdf_path':f"./uploads/{arxiv_id}.pdf",'prev_node':'user_confirmation'}
         else:
-            return {'next_node':"END",'result':"Ok! You can ask me to fetch some other paper or ask questions on fetched papers.",'prev_node':'user_confirmation'}
+            
+            text = "Ok! You can ask me to fetch some other paper or ask questions on fetched papers."
+            
+            state["chat_history"].append(HumanMessage(content=state['query']))
+            state["chat_history"].append(AIMessage(content=text))
+            
+            return {'next_node':"END",'result':text,'prev_node':'user_confirmation'}
 
     def create_agent(self):
         graph = StateGraph(AgentState)
@@ -367,7 +420,7 @@ class Agent:
         graph.add_node("classify_query_intent",self._classify_query_intent)
         graph.add_node("fetch_arxiv_paper",self._fetch_arxiv_paper)
         graph.add_node("user_confirmation",self._user_confirmation)
-
+        
         graph.set_entry_point("Router")
 
 
