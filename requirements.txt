@@ -1,0 +1,15 @@
+Flask
+Werkzeug
+langchain-core
+langchain
+torch
+rapidocr
+pillow
+pymupdf
+pydantic
+tabula-py
+arxiv
+sentence-transformers
+groq
+onnxruntime
+chromadb
