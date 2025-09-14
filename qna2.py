@@ -18,6 +18,11 @@ from langchain_core.documents import Document
 from typing import TypedDict,Annotated,Union,List, Literal
 from pydantic import BaseModel, Field
 import PIL
+
+import re
+import tabula
+from collections import Counter
+
 from langchain_community.retrievers import ArxivRetriever
 from langgraph.types import Command, interrupt
 from langgraph.graph import END, StateGraph
@@ -66,7 +71,7 @@ class Parser:
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": "Describe the image in 50 words as much as possible/"},
+                            {"type": "text", "text": "Describe the image in no more than 100 words as much as possible/"},
                             {
                                 "type": "image_url",
                                 "image_url": {
@@ -124,12 +129,102 @@ class Parser:
         text = "\n".join(text for text in tables_list)
 
         return text
+    def _get_table_from_pg(self,pdf_path,pg):
+        tables = tabula.read_pdf(pdf_path,pages=str(pg+1),multiple_tables=True)
+        return tables
+    
+    def _extract_formulas_from_text(self,text):
+        formulas = []
+
+        # 1. LaTeX inline math: $...$
+        inline_latex = re.findall(r'\$(.+?)\$', text)
+        formulas.extend([f.strip() for f in inline_latex])
+
+        # 2. LaTeX display math: \[...\]
+        display_latex = re.findall(r'\\\[(.+?)\\\]', text, flags=re.DOTALL)
+        formulas.extend([f.strip() for f in display_latex])
+
+        # 3. LaTeX equation environments
+        env_latex = re.findall(r'\\begin{equation\*?}(.+?)\\end{equation\*?}', text, flags=re.DOTALL)
+        formulas.extend([f.strip() for f in env_latex])
+
+        # 4. LaTeX align environments
+        align_envs = re.findall(r'\\begin{align\*?}(.+?)\\end{align\*?}', text, flags=re.DOTALL)
+        formulas.extend([f.strip() for f in align_envs])
+
+        # 5. ASCII/Unicode math heuristics (e.g., x^2 + y^2 = z^2 or x² + y² = z²)
+        # Look for lines with multiple math symbols or variables
+        math_lines = []
+        for line in text.splitlines():
+            if re.search(r'[a-zA-Z0-9][\^²³√±*/=<>+\-]+[a-zA-Z0-9]', line):
+                if len(line.strip()) > 5:  # avoid noise
+                    math_lines.append(line.strip())
+
+        # Filter duplicates and obvious non-formulas
+        for line in math_lines:
+            if line not in formulas and not line.startswith('Figure') and '=' in line:
+                formulas.append(line)
+
+        return formulas
+    
+    
+    def _common_font_size(self,pdf_path):
+        doc = pymupdf.open(pdf_path)
+        font_sizes = []
+
+        for page in doc:
+            blocks = page.get_text("dict")["blocks"]
+            for b in blocks:
+                if "lines" in b:
+                    for line in b["lines"]:
+                        for span in line["spans"]:
+                            font_sizes.append(span["size"])
+        counter = Counter(font_sizes)
+        return counter.most_common()[0][0]
+
+    def _format_headings(self,headings):
+        prev_y = 0
+        result = ""
+        for heading in headings:
+            if heading['bbox'][1]!=prev_y:
+                result += "\n"
+            result+=heading['text']+" "
+            prev_y = heading['bbox'][1]
+        return result
+
+    def _get_headings(self,page,comm_font_size):
+        headings = []
+        blocks = page.get_text("dict")["blocks"]
+        for block in blocks:
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    font_size = round(span.get("size", 0))
+                    font_flags = span.get("flags", 0)
+                    text = span.get("text", "").strip()
+
+                        # Skip empty strings
+                    if not text:
+                        continue
+
+                        # Heuristic: large font size is probably a heading
+                    if font_size > round(comm_font_size) or (font_size == round(comm_font_size) and (font_flags & pymupdf.TEXT_FONT_BOLD or "Bold" in span.get("font", ""))):
+                        headings.append({
+                            "text": text,
+                            "size": font_size,
+                            "font": span.get("font"),
+                            "flags": font_flags,
+                            "bbox": span.get("bbox"),
+                        })
+
+        return self._format_headings(headings)
+
 
     def parse_pdf(self,path):
         global log_messages
         log_messages.append("Parsing the pdf")
         doc = pymupdf.open(path)
         parsed = []
+        comm_font_size = self._common_font_size(path)
 
         for i in range(doc.page_count):
             print(f"Page {i+1}",end="")
@@ -146,13 +241,17 @@ class Parser:
                 table = ""
             else:
                 img = self._extract_captions_of_images(doc,pg)
-                table = self._extract_table_content(pg)
+#                 table = self._extract_table_content(pg)
+                table = self._get_table_from_pg(path,i)
+                headings = self._get_headings(pg,comm_font_size)
 
             full_pg['text'] = text
             full_pg['tables'] = table
             full_pg['imgs'] = img
             full_pg['page'] = i+1
-
+            full_pg['headings'] = headings
+            full_pg['formulas'] = self._extract_formulas_from_text(text)
+        
             parsed.append(full_pg)
             print(f"..Done.. {time.time()-start_time}")
 
@@ -161,7 +260,8 @@ class Parser:
 
 class AgentState(TypedDict):
     query: str
-    pdf_path: str
+#     pdf_path: str
+    pdf_path: list[str]
     result: str
     imgs: list[str]
     paper_url: str
@@ -169,15 +269,27 @@ class AgentState(TypedDict):
     prev_node: str
     chat_history: List[BaseMessage]
 
+# class Classifier(BaseModel):
+#     reasoning: str = Field(
+#         description="""Step by step reasoning for generated 'classify_intent'."""
+#     )
+#     classify_intent: Literal["fetch_paper","RAG_qna"] = Field(
+#         description = """Classify the intent of user query:
+#         'fetch_paper': if the query have 'fetch','retrieve','get' like words and asking for some research paper.
+#         'RAG_qna': if it is not fetch_paper and user is asking question directly that require additional information from RAG process."""
+#     )
 class Classifier(BaseModel):
     reasoning: str = Field(
-        description="""Step by step reasoning for generated 'classify_intent'."""
+        description="Step by step reasoning for generated 'classify_intent'."
     )
     classify_intent: Literal["fetch_paper","RAG_qna"] = Field(
-        description = """Analyse the query and chat history then Classify the intent of user query,
-        'fetch_paper' if user is asking for specific research paper,strictly have words like 'fetch','retrieve','get'.
-        'RAG_qna' if user is asking questions directly about some topic."""
+        description="""Classify the intent of user query:
+        - 'fetch_paper': if the query stricly has 'fetch','retrieve','get' like words and is asking to fetch or get  a research paper.
+        - 'RAG_qna': otherwise, if the query is a direct question requiring RAG. Also note that queries asking for information on paper comes under this because user is not stricly asking to get or fetch a paper.
+        - If nothing matches or you are not sure return 'RAG_qna' as default. """
     )
+        
+
 
 class Agent:
     def __init__(self,vdb_name:str,vdb_path:str,api_key:str):
@@ -197,31 +309,50 @@ class Agent:
         self._text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
             chunk_size=500, chunk_overlap=100
         )
-        self._llm = init_chat_model('groq:llama-3.1-8b-instant',temperature=0.2,api_key= api_key)
+#         self._llm = init_chat_model('groq:llama-3.1-8b-instant',temperature=0.2,api_key= api_key)
+        self._llm = init_chat_model("groq:meta-llama/llama-4-scout-17b-16e-instruct",temperature=0.2,api_key= api_key)
+#         self.classifier_prompt = ChatPromptTemplate.from_messages([
+#                 ("system", """You are a strict classifier. 
+#                 Do NOT answer the user’s question. Do NOT use 
+#                 Only return JSON following the schema with 'reasoning' and 'classify_intent'.
+
+#                 classify_intent rules:
+#                 - "fetch_paper": if the query contains words like 'fetch','retrieve','get' and is about research papers.
+#                 - "RAG_qna": if the query is asking a direct question that needs additional information from RAG.
+#                 """),
+#                 ("human", "{query}")
+#             ])
         self._llm_router = self._llm.with_structured_output(Classifier)
         self._retriever_arxiv = ArxivRetriever(
             load_max_docs=1,
             get_ful_documents=True,
         )
-        
     def _parse_and_embed(self,state:AgentState):
         global log_messages
-        log_messages.append("In parse and embed")
+#         log_messages.append("In parse and embed")
         
         print("In parse_and_embed")
         
-        result = self._parser.parse_pdf(state['pdf_path'])
-        pdf_path = "/".join(state['pdf_path'].split('/')[:-1])+"/"+secure_filename(state['pdf_path'].split('/')[-1])
+        for pdf in state['pdf_path']:
+            print(f"Parsing {pdf}")
+            result = self._parser.parse_pdf(pdf)
+            pdf_path = "/".join(pdf.split('/')[:-1])+"/"+secure_filename(pdf.split('/')[-1])
         
-        docs_list = [Document(page_content=page['text']+"\n\n"+page['tables']+"\n\n"+"\n".join(page['imgs'][key] for key in page['imgs'].keys()),
+            docs_list = [Document(page_content=page['text']+"\n\n"+'\n\n\n\n'.join(table.to_markdown() for table in page['tables'])
+                      +"\n\n"+"\n".join(page['imgs'][key] for key in page['imgs'].keys())+"\n\n"+
+                      page['headings']+"\n\n"+'\n'.join(formula for formula in page['formulas']),
                           metadata={"page": page['page'],"imgs":False if not page['imgs'] else ",".join(img.split('_')[1] for img in page['imgs']), 
-                                   'pdf_path':pdf_path}) for page in result]
+                                   'pdf_path':pdf,"headings":','.join(heading for heading in page['headings'].split('\n'))}) for page in result]
 
-        doc_splits = self._text_splitter.split_documents(docs_list)
 
-        self._vectorstore.add_documents(documents=doc_splits)
+
+
+
+            doc_splits = self._text_splitter.split_documents(docs_list)
+
+            self._vectorstore.add_documents(documents=doc_splits)
         
-        print("parsed and embedded the pdf")
+            print(f"parsed and embedded the pdf {pdf}")
 
         if state['prev_node'] == 'user_confirmation':
             return {'result':"Parsed the pdf! now you can ask questions related to it.",'next_node':'END','prev_node':'parse_and_embed'}
@@ -230,7 +361,7 @@ class Agent:
 
     def _fetch_arxiv_paper(self,state:AgentState):
         global log_messages
-        log_messages.append("In fetch_arxiv_paper")
+#         log_messages.append("In fetch_arxiv_paper")
         
         print("In fetch_arxiv_paper")
         
@@ -247,7 +378,11 @@ class Agent:
         })
 
         docs = self._retriever_arxiv.invoke(result.content)
-
+        
+        print('='*10)
+        print(docs)
+        print('='*10)
+        
         for doc in docs:
             paper_info = {
                 "title": doc.metadata['Title'],
@@ -265,7 +400,7 @@ class Agent:
 
     def _rag_and_generate(self,state:AgentState):
         global log_messages, ret_chunks
-        log_messages.append("In rag_and_generate")
+#         log_messages.append("In rag_and_generate")
         
         print("In rag_and_generate")
 
@@ -293,7 +428,6 @@ class Agent:
         
         docs1 = self._retriever.invoke(result.content)
         docs2 = self._retriever.invoke(state['query'])
-
         docs = []
         for doc in docs1:
             if not doc in docs:
@@ -301,57 +435,94 @@ class Agent:
         for doc in docs2:
             if not doc in docs:
                 docs.append(doc)
+       
 
+        
         pairs = [[state['query']+"\n\n"+result.content, doc.page_content] for doc in docs]
-
+        
+        
         #reranker
         scores = self._cross_encoder.predict(pairs)
 
         comb_text = sorted(dict(zip(scores,list(range(0,len(pairs))))).items(),reverse=True)
         top_3_content = "\n\n".join(docs[t[1]].page_content for t in comb_text[:3])
-
-
-        prompt = ChatPromptTemplate.from_messages([
-            ("system","""Use the following pieces of context to answer the question at the end. If you don't know the answer, just say that you don't know, don't try to make up an answer. Keep the answer as concise as possible. Always say "thanks for asking!" at the end of the answer"""),
-            MessagesPlaceholder('chat_history'),
-            ("human","Context:{context}\n\nInput:{input}")
-        ])
-        chain = prompt | self._llm
-
-        result = chain.invoke({
-            "input":state['query'],
-            "chat_history":state['chat_history'],
-            "context":top_3_content
-        })
-
+        
+        
         try:
-            pdf = pymupdf.open(docs[comb_text[0][1]].metadata['pdf_path'])
+            imgs = [ docs[t[1]].metadata['imgs'] for t in comb_text if docs[t[1]].metadata['imgs']!=False]
+            imgs = [int(idx) for img in imgs for idx in img.split(',')]
+            base64_image = ""
+        except Exception as e:
+            print("ERROR in imgs")
+        
+        try:
+            doc = pymupdf.open(docs[comb_text[0][1]].metadata['pdf_path'])
+            #Considering only 1 image for now
+            img = doc.extract_image(imgs[0])
+            base_img = img['image']
+            img_ext = img['ext']
+            image = Image.open(io.BytesIO(base_img))
+            image = image.resize((400,400))
+            output = io.BytesIO()
+            image.save(output, format='png')
+            base64_image = base64.b64encode(output.getvalue()).decode('utf-8')
+            
         except Exception as e:
             print("="*10)
-            print(f"ERROR IN PDF OPENING:{e}")
+            print(f"ERROR IN PDF OPENING :{e}")
             print(docs[comb_text[0][1]].metadata['pdf_path'])
             print("="*10)
-            return
+           
         
-        imgs = []
+        
+#         print(base64_image)
+        if base64_image != "":
+            prompt = ChatPromptTemplate.from_messages([
+                ("system","""Use the following pieces of context to answer the question at the end.
+                If you don't know the answer, just say that you don't know, don't try to make up an answer.
+                Keep the answer as concise as possible.
+                Make sure the answer is long and descriptive, avoid short answers.
+                Always say "thanks for asking!" at the end of the answer"""),
+                MessagesPlaceholder('chat_history'),
+                (
+                    "human", [
+                        {"type": "text", "text": "Context: {context}\n\nInput: {input}"},
+                        {"type": "image_url", "image_url": {"url": "{image_url}"}}
+                    ]
+                )
+            ])
+            chain = prompt | self._llm
+
+            result = chain.invoke({
+                "input":state['query'],
+                "chat_history":state['chat_history'],
+                "context":top_3_content,
+                "image_url": "data:image/png;base64,"+base64_image
+            })
+        else:
+            prompt = ChatPromptTemplate.from_messages([
+                ("system","""Use the following pieces of context to answer the question at the end.
+                If you don't know the answer, just say that you don't know, don't try to make up an answer.
+                Keep the answer as concise as possible.
+                Make sure the answer is long and descriptive, avoid short answers.
+                Always say "thanks for asking!" at the end of the answer"""),
+                MessagesPlaceholder('chat_history'),
+                (
+                    "human", [
+                        {"type": "text", "text": "Context: {context}\n\nInput: {input}"},
+                    ]
+                )
+            ])
+            chain = prompt | self._llm
+
+            result = chain.invoke({
+                "input":state['query'],
+                "chat_history":state['chat_history'],
+                "context":top_3_content
+            })
         for t in comb_text:
-            #to show retrieved chunks on UI
             ret_chunks.append(docs[t[1]].to_json())
             
-            if not docs[t[1]].metadata['imgs']:
-                continue
-            try:
-                for img_no in docs[t[1]].metadata['imgs'].split(','):
-                    img = pdf.extract_image(int(img_no))
-                    base_img = img['image']
-                    img_ext = img['ext']
-                    image = base_img
-                    imgs.append(image)
-            except Exception as e:
-                print("="*10)
-                print(f"ERROR IN IMAGE EXTRACTING:{e}")
-                print(docs[t[1]])
-                print("="*10)
         
         state["chat_history"].append(HumanMessage(content=state['query']))
         state["chat_history"].append(AIMessage(content=result.content))
@@ -360,18 +531,20 @@ class Agent:
 
     def _classify_query_intent(self,state:AgentState):
         global log_messages
-        log_messages.append("In classify_query_intent")
+#         log_messages.append("In classify_query_intent")
         
         print("In classify_query_intent")
         
-
+#         chain = self.classifier_prompt | self._llm_router
+#         result = self._llm_router.invoke({"query": state["query"]})
+#         result = chain.invoke({"query": state["query"]})
         result = self._llm_router.invoke(
             [
-                {"role": "system", "content": "you are an excellent classifier of user query."},
+                {"role": "system", "content": "you are an excellent classifier of user query. Always return 'RAG_qna' if you are not sure about answer or fallback to this."},
                 {"role": "user", "content": state['query']}
             ]
         )
-        
+    
         print("="*10)
         print(result.reasoning)
         print(result.classify_intent)
@@ -386,7 +559,7 @@ class Agent:
     def _router(self,state:AgentState):
         print("In router")
         
-        if state['pdf_path'] == None:
+        if state['pdf_path'] == None or state['pdf_path']==[]:
             return {'next_node':'classify_query_intent','prev_node':'router'}
         else:
             return {'next_node':'parse_and_embed','prev_node':'router'}
