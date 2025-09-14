@@ -4,7 +4,7 @@ An interactive web-based AI chatbot that allows users to upload documents (PDF) 
 
 ## 🎨 Images
 
-![Alt text](images/img1.png)
+![Alt text](images/img3.png)
 
 ## 🧠 Agent Workflow
 
@@ -12,14 +12,15 @@ An interactive web-based AI chatbot that allows users to upload documents (PDF) 
 
 ## 🚀 Features
 
-- 📎 Upload and parse PDF documents 
+- 📎 Upload and parse multiple PDF documents 
 - 💬 Ask natural language questions based on the document
 - 🧠 Powered by a LangGraph-based intelligent agent
-- ⚡ Parses text, tables, using PyMuPdf and captions Images using the VLM.
+- ⚡ Parses text, tables, headings, formulas using PyMuPdf and captions Images using the VLM.
+- 🤖 Uses multimodal LLM(meta-llama/llama-4-scout-17b-16e-instruct).
 - 🔍 **RAG pipeline** with:
-  - ✅ Query Expansion (auto-enhanced search intent)
-  - 🧠 ChromaDB vector store (document indexing)
-  - 🎯 Cross-encoder reranking (semantic accuracy boost) 
+  - ✅ Query Expansion 
+  - 🧠 ChromaDB vector store 
+  - 🎯 Cross-encoder reranking 
 - 🔁 Human-in-the-loop interrupt/resume flow for paper fetching using Arxiv API
 - 🌐 Simple and responsive web UI (Flask + Vanilla JS)
 
@@ -36,7 +37,7 @@ An interactive web-based AI chatbot that allows users to upload documents (PDF) 
 | Reranking     | cross-encoder/ms-marco-MiniLM-L-6-v2                            |
 | Document Parsing              | PyMuPDF |
 | Web App         | Flask + Vanilla JS           |
-|LLM              | groq: llama-3.1-8b-instant          |
+|LLM              | groq: meta-llama/llama-4-scout-17b-16e-instruct          |
 
 ---
 
