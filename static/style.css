@@ -144,3 +144,12 @@ body {
   overflow-y: auto;
 }
 
+#loadingMessage {
+  text-align: center;
+  margin: 10px auto;
+  padding: 8px 12px;
+  font-style: italic;
+  color: #555;
+  font-size: 14px;
+  display: none; /* Hidden by default */
+}
