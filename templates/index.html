@@ -5,6 +5,15 @@
   <title>Document QnA Chat</title>
   <link rel="stylesheet" href="/static/style.css" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    #loadingMessage {
+      text-align: center;
+      margin: 10px;
+      font-style: italic;
+      color: #555;
+      display: none;
+    }
+  </style>
 </head>
 <body>
   <div class="chat-wrapper">
@@ -13,6 +22,9 @@
     <div class="chat-container" id="chat">
       <!-- Chat messages go here -->
     </div>
+
+    <!-- ✅ Loading Message -->
+    <div id="loadingMessage">⏳ Generating response...</div>
 
     <div class="input-row">
       <button id="uploadBtn" title="Upload Document">📎</button>
@@ -27,14 +39,13 @@
       <button id="sendBtn" title="Send">📤</button>
     </div>
   </div>
+
   <div class="chunk-panel" id="chunkPanel">
-      <div class="chunk-header" onclick="toggleChunkContent()">📄 Retrieved Chunks</div>
-      <div class="chunk-content collapsed" id="chunkContent">
-        <p>No chunks retrieved yet.</p>
-      </div>
+    <div class="chunk-header" onclick="toggleChunkContent()">📄 Retrieved Chunks</div>
+    <div class="chunk-content collapsed" id="chunkContent">
+      <p>No chunks retrieved yet.</p>
+    </div>
   </div>
-
-
 
   <script>
     let context = "";
@@ -44,6 +55,7 @@
     const uploadBtn = document.getElementById("uploadBtn");
     const sendBtn = document.getElementById("sendBtn");
     const questionInput = document.getElementById("questionInput");
+    const loadingMessage = document.getElementById("loadingMessage"); // ✅
 
     uploadBtn.onclick = () => fileInput.click();
 
@@ -72,18 +84,29 @@
       appendMessage("user", question);
       questionInput.value = "";
 
-      const res = await fetch("/ask", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question, context }),
-      });
+      // ✅ Add temporary "Generating..." assistant message
+      const loadingMsgElement = appendMessage("assistant", "⏳ Generating response...");
 
-      const data = await res.json();
-      appendMessage("assistant", data.answer);
-        
-      fetchChunks();
-      questionInput.focus();
+      try {
+        const res = await fetch("/ask", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ question, context }),
+        });
+
+        const data = await res.json();
+
+        // ✅ Replace loading message with actual answer
+        loadingMsgElement.innerHTML = formatTextToHTML(data.answer);
+        fetchChunks();
+      } catch (err) {
+        loadingMsgElement.innerHTML = "❌ Failed to get response.";
+        console.error("Error:", err);
+      } finally {
+        questionInput.focus();
+      }
     }
+
 
     sendBtn.onclick = sendMessage;
 
@@ -96,9 +119,9 @@
 
     function formatTextToHTML(text) {
       return text
-        .replace(/\n/g, "<br>")                      // newline to <br>
-        .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")      // **bold**
-        .replace(/\*(.+?)\*/g, "<i>$1</i>");         // *italic*
+        .replace(/\n/g, "<br>")
+        .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
+        .replace(/\*(.+?)\*/g, "<i>$1</i>");
     }
 
     function appendMessage(role, text) {
@@ -107,13 +130,15 @@
       msg.innerHTML = formatTextToHTML(text);
       chat.appendChild(msg);
       chat.scrollTop = chat.scrollHeight;
+      return msg; // ✅ return the element so we can update it later
     }
+
+
     function toggleChunkContent() {
       const content = document.getElementById("chunkContent");
       content.classList.toggle("expanded");
       content.classList.toggle("collapsed");
     }
-
 
     async function fetchChunks() {
       try {
@@ -140,8 +165,6 @@
       }
     }
 
-
-      
     setInterval(async () => {
       try {
         const res = await fetch("/logs");
@@ -153,7 +176,6 @@
         console.error("Log polling error:", e);
       }
     }, 1000);
-
 
     window.onload = () => questionInput.focus();
   </script>
